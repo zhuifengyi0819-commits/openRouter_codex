@@ -1,0 +1,203 @@
+import type { IncomingHttpHeaders } from "node:http";
+
+import type { OpenAIChatCompletionRequest, UpstreamConfig } from "../types/api.js";
+import { isCodexUpstream } from "../core/openai-upstream.js";
+import { buildAuthHeaders } from "../core/upstream-auth.js";
+import { OpenAICodexProvider } from "./openai-codex.provider.js";
+
+interface OpenAIRequestAffinityOptions {
+  sessionId?: string;
+  promptCacheKey?: string;
+}
+
+function appendIfPresent(headers: Headers, source: IncomingHttpHeaders, key: string): void {
+  const value = source[key];
+  if (typeof value === "string" && value.length > 0) {
+    headers.set(key, value);
+  }
+}
+
+function redactHeaderValue(key: string, value: string): string {
+  const normalized = key.toLowerCase();
+  if (
+    normalized === "authorization" ||
+    normalized === "x-api-key" ||
+    normalized === "cookie" ||
+    normalized === "set-cookie" ||
+    normalized === "proxy-authorization"
+  ) {
+    return "[redacted]";
+  }
+
+  return value;
+}
+
+function buildUpstreamHeaders(upstream: UpstreamConfig, requestHeaders: IncomingHttpHeaders): Headers {
+  const headers = new Headers({
+    "content-type": "application/json",
+    ...buildAuthHeaders(upstream, "authorization_bearer"),
+    ...upstream.headers
+  });
+  if (upstream.authMode !== "oauth2") {
+    appendIfPresent(headers, requestHeaders, "openai-organization");
+  }
+  appendIfPresent(headers, requestHeaders, "openai-project");
+  return headers;
+}
+
+function logRequest(method: string, url: string, headers: Headers, extra?: string): void {
+  const h: Record<string, string> = {};
+  headers.forEach((v, k) => { h[k] = redactHeaderValue(k, v); });
+  console.log(`[openai] ${method} ${url}`);
+  console.log(`[openai] headers=${JSON.stringify(h)}`);
+  if (extra) console.log(`[openai] ${extra}`);
+}
+
+export class OpenAIProvider {
+  private readonly codexProvider = new OpenAICodexProvider();
+
+  public async createChatCompletion(
+    upstream: UpstreamConfig,
+    payload: OpenAIChatCompletionRequest,
+    requestHeaders: IncomingHttpHeaders,
+    options?: OpenAIRequestAffinityOptions
+  ): Promise<Response> {
+    if (isCodexUpstream(upstream)) {
+      return this.codexProvider.createChatCompletion(upstream, payload, options);
+    }
+
+    const headers = buildUpstreamHeaders(upstream, requestHeaders);
+    const url = `${upstream.baseUrl}/v1/chat/completions`;
+    logRequest("POST", url, headers, `model=${payload.model} stream=${payload.stream ?? false}`);
+
+    return fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+  }
+
+  public async createResponse(
+    upstream: UpstreamConfig,
+    payload: Record<string, unknown>,
+    requestHeaders: IncomingHttpHeaders,
+    options?: OpenAIRequestAffinityOptions
+  ): Promise<Response> {
+    if (isCodexUpstream(upstream)) {
+      return this.codexProvider.createResponse(upstream, payload, options);
+    }
+
+    const headers = buildUpstreamHeaders(upstream, requestHeaders);
+    const url = `${upstream.baseUrl}/v1/responses`;
+    logRequest("POST", url, headers, `model=${payload.model ?? "?"} stream=${payload.stream ?? false}`);
+
+    return fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+  }
+
+  public async createEmbedding(
+    upstream: UpstreamConfig,
+    payload: Record<string, unknown>,
+    requestHeaders: IncomingHttpHeaders
+  ): Promise<Response> {
+    const headers = buildUpstreamHeaders(upstream, requestHeaders);
+    const url = `${upstream.baseUrl}/v1/embeddings`;
+    logRequest("POST", url, headers, `model=${payload.model ?? "?"}`);
+
+    return fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+  }
+
+  public async listModels(
+    upstream: UpstreamConfig,
+    requestHeaders: IncomingHttpHeaders
+  ): Promise<Response> {
+    if (isCodexUpstream(upstream)) {
+      return new Response(JSON.stringify({
+        object: "list",
+        data: (upstream.models ?? []).map((id) => ({
+          id,
+          object: "model",
+          owned_by: upstream.id
+        }))
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json; charset=utf-8"
+        }
+      });
+    }
+
+    const headers = buildUpstreamHeaders(upstream, requestHeaders);
+    const url = `${upstream.baseUrl}/v1/models`;
+    logRequest("GET", url, headers);
+
+    return fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(upstream.timeoutMs ?? 30_000)
+    });
+  }
+
+  public async getModel(
+    upstream: UpstreamConfig,
+    modelId: string,
+    requestHeaders: IncomingHttpHeaders
+  ): Promise<Response> {
+    if (isCodexUpstream(upstream)) {
+      const exists = (upstream.models ?? []).includes(modelId);
+      return new Response(JSON.stringify(
+        exists
+          ? { id: modelId, object: "model", owned_by: upstream.id }
+          : { error: { message: `Unknown model "${modelId}"` } }
+      ), {
+        status: exists ? 200 : 404,
+        headers: {
+          "content-type": "application/json; charset=utf-8"
+        }
+      });
+    }
+
+    const headers = buildUpstreamHeaders(upstream, requestHeaders);
+    const url = `${upstream.baseUrl}/v1/models/${encodeURIComponent(modelId)}`;
+    logRequest("GET", url, headers);
+
+    return fetch(url, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(upstream.timeoutMs ?? 30_000)
+    });
+  }
+
+  public async proxy(
+    upstream: UpstreamConfig,
+    method: string,
+    path: string,
+    requestHeaders: IncomingHttpHeaders,
+    body?: string
+  ): Promise<Response> {
+    if (isCodexUpstream(upstream)) {
+      return this.codexProvider.proxy(upstream, method, path, body);
+    }
+
+    const headers = buildUpstreamHeaders(upstream, requestHeaders);
+    const url = `${upstream.baseUrl}${path}`;
+    logRequest(method, url, headers);
+
+    return fetch(url, {
+      method,
+      headers,
+      body: method !== "GET" && method !== "HEAD" ? body : undefined,
+      signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+  }
+}
