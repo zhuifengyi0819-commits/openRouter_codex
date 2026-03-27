@@ -67,7 +67,7 @@ export async function ensureFreshToken(
 }
 
 export function startTokenRefreshLoop(runtime: GatewayRuntime, intervalMs = 60_000): NodeJS.Timeout {
-  return setInterval(async () => {
+  const timer = setInterval(async () => {
     const upstreams = runtime.getConfig().upstreams.filter((u) => u.authMode === "oauth2");
     for (const upstream of upstreams) {
       if (isExpiringSoon(upstream)) {
@@ -75,4 +75,6 @@ export function startTokenRefreshLoop(runtime: GatewayRuntime, intervalMs = 60_0
       }
     }
   }, intervalMs);
+  timer.unref();
+  return timer;
 }

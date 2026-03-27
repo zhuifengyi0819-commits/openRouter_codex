@@ -42,4 +42,9 @@ export async function registerMetaRoutes(app: FastifyInstance, deps: RouteDeps):
     object: "list",
     data: deps.runtime.getGateway().getWorkspaceSummaries()
   }));
+
+  app.get("/v1/gateway/usage", async (request) => {
+    const workspaceId = getWorkspaceId(request.headers["x-workspace-id"]);
+    return deps.runtime.getUsageSummary(workspaceId);
+  });
 }

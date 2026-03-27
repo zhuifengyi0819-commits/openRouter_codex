@@ -1,6 +1,7 @@
 import { Readable } from "node:stream";
 
 import type { FastifyReply } from "fastify";
+import { getRequestTraceId, logResponseSnapshot } from "./request-logs.js";
 
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -19,6 +20,7 @@ export function relayResponse(
   upstreamResponse: Response,
   extraHeaders: Record<string, string> = {}
 ): FastifyReply | Promise<FastifyReply> {
+  const traceId = getRequestTraceId(reply.request.headers as Record<string, unknown>);
   reply.code(upstreamResponse.status);
 
   for (const [key, value] of upstreamResponse.headers.entries()) {
@@ -30,6 +32,11 @@ export function relayResponse(
   for (const [key, value] of Object.entries(extraHeaders)) {
     reply.header(key, value);
   }
+
+  logResponseSnapshot(traceId, "gateway.response", upstreamResponse, {
+    source: "upstream_relay",
+    extraHeaders
+  });
 
   if (!upstreamResponse.body) {
     return reply.send();

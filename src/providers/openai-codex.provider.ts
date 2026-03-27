@@ -1,6 +1,7 @@
 import type { OpenAIChatCompletionRequest, UpstreamConfig } from "../types/api.js";
 import { buildCodexHeaders, resolveCodexProxyUrl, resolveCodexResponsesUrl } from "../core/openai-upstream.js";
 import { GatewayError } from "../core/http-error.js";
+import { appendTraceEvent, logResponseSnapshot, sanitizeHeaders, sanitizeValue } from "../core/request-logs.js";
 
 interface CodexEvent {
   type?: string;
@@ -32,6 +33,7 @@ interface ChatCompletionAggregate {
 interface CodexRequestOptions {
   sessionId?: string;
   promptCacheKey?: string;
+  traceId?: string;
 }
 
 function createSyntheticId(prefix: string): string {
@@ -371,7 +373,6 @@ function buildCodexInputFromChatMessages(messages: unknown[]): {
           type: "message",
           role: "assistant",
           status: "completed",
-          id: createSyntheticId("msg"),
           content: assistantContent
         });
       }
@@ -488,9 +489,9 @@ function buildCodexRequestFromChatCompletion(
   }
 
   if (typeof payload.max_tokens === "number") {
-    body.max_output_tokens = payload.max_tokens;
+    /* Codex backend rejects max_output_tokens/max_tokens on responses wire shape. */
   } else if (typeof payload.max_completion_tokens === "number") {
-    body.max_output_tokens = payload.max_completion_tokens;
+    /* ignore */
   }
 
   if (typeof payload.temperature === "number") {
@@ -563,10 +564,45 @@ function buildCodexRequestFromResponses(
   payload: Record<string, unknown>,
   options: CodexRequestOptions = {}
 ): Record<string, unknown> {
+  let normalizedInput = payload.input;
+  let derivedInstructions: string | undefined;
+
+  if (Array.isArray(payload.input)) {
+    const roleBasedItems = payload.input.filter((item) => {
+      const obj = toObject(item);
+      return typeof obj?.role === "string";
+    });
+
+    if (roleBasedItems.length > 0) {
+      const converted = buildCodexInputFromChatMessages(payload.input);
+      if (converted.input.length > 0) {
+        normalizedInput = converted.input;
+      }
+      derivedInstructions = converted.instructions;
+    }
+  }
+
   const body: Record<string, unknown> = {
     ...payload,
+    input: normalizedInput,
     store: payload.store === true ? true : false
   };
+  delete body.max_output_tokens;
+  delete body.max_tokens;
+  delete body.max_completion_tokens;
+  delete body.maxCompletionTokens;
+
+  const explicitInstructions = getString(payload.instructions);
+  if (explicitInstructions && derivedInstructions) {
+    body.instructions = `${explicitInstructions}\n\n${derivedInstructions}`;
+  } else if (explicitInstructions) {
+    body.instructions = explicitInstructions;
+  } else if (derivedInstructions) {
+    body.instructions = derivedInstructions;
+  } else {
+    body.instructions = "";
+  }
+
   const promptCacheKey =
     getString(payload.prompt_cache_key) ??
     getString(toObject(payload.metadata)?.prompt_cache_key) ??
@@ -824,18 +860,38 @@ export class OpenAICodexProvider {
   ): Promise<Response> {
     const requestBody = buildCodexRequestFromChatCompletion(payload, options);
     requestBody.stream = true;
-
-    const response = await fetch(resolveCodexResponsesUrl(upstream.baseUrl), {
+    const url = resolveCodexResponsesUrl(upstream.baseUrl);
+    const headers = buildCodexHeaders(upstream, {
+      "content-type": "application/json",
+      "openai-beta": "responses=experimental"
+    }, {
+      accept: "text/event-stream",
+      sessionId: options.sessionId
+    });
+    void appendTraceEvent(options.traceId, {
+      stage: "codex.request",
+      provider: "openai",
+      upstreamId: upstream.id,
+      upstreamMode: "codex",
+      operation: "chat_completions",
       method: "POST",
-      headers: buildCodexHeaders(upstream, {
-        "content-type": "application/json",
-        "openai-beta": "responses=experimental"
-      }, {
-        accept: "text/event-stream",
-        sessionId: options.sessionId
-      }),
+      url,
+      headers: sanitizeHeaders(headers),
+      body: sanitizeValue(requestBody)
+    });
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
       body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+    logResponseSnapshot(options.traceId, "codex.response", response, {
+      provider: "openai",
+      upstreamId: upstream.id,
+      upstreamMode: "codex",
+      operation: "chat_completions",
+      url
     });
 
     if (!response.ok) {
@@ -1070,17 +1126,38 @@ export class OpenAICodexProvider {
     payload: Record<string, unknown>,
     options: CodexRequestOptions = {}
   ): Promise<Response> {
-    const response = await fetch(resolveCodexResponsesUrl(upstream.baseUrl), {
+    const url = resolveCodexResponsesUrl(upstream.baseUrl);
+    const requestBody = buildCodexRequestFromResponses(payload, options);
+    const headers = buildCodexHeaders(upstream, {
+      "content-type": "application/json",
+      "openai-beta": "responses=experimental"
+    }, {
+      accept: payload.stream === true ? "text/event-stream" : "application/json",
+      sessionId: options.sessionId
+    });
+    void appendTraceEvent(options.traceId, {
+      stage: "codex.request",
+      provider: "openai",
+      upstreamId: upstream.id,
+      upstreamMode: "codex",
+      operation: "responses",
       method: "POST",
-      headers: buildCodexHeaders(upstream, {
-        "content-type": "application/json",
-        "openai-beta": "responses=experimental"
-      }, {
-        accept: payload.stream === true ? "text/event-stream" : "application/json",
-        sessionId: options.sessionId
-      }),
-      body: JSON.stringify(buildCodexRequestFromResponses(payload, options)),
+      url,
+      headers: sanitizeHeaders(headers),
+      body: sanitizeValue(requestBody)
+    });
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestBody),
       signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+    logResponseSnapshot(options.traceId, "codex.response", response, {
+      provider: "openai",
+      upstreamId: upstream.id,
+      upstreamMode: "codex",
+      operation: "responses",
+      url
     });
 
     if (!response.ok) {
@@ -1094,13 +1171,35 @@ export class OpenAICodexProvider {
     upstream: UpstreamConfig,
     method: string,
     path: string,
-    body?: string
+    body?: string,
+    traceId?: string
   ): Promise<Response> {
-    const response = await fetch(resolveCodexProxyUrl(upstream.baseUrl, path), {
+    const url = resolveCodexProxyUrl(upstream.baseUrl, path);
+    const headers = buildCodexHeaders(upstream, body ? { "content-type": "application/json" } : {});
+    void appendTraceEvent(traceId, {
+      stage: "codex.request",
+      provider: "openai",
+      upstreamId: upstream.id,
+      upstreamMode: "codex",
+      operation: "proxy",
       method,
-      headers: buildCodexHeaders(upstream, body ? { "content-type": "application/json" } : {}),
+      url,
+      headers: sanitizeHeaders(headers),
+      body: sanitizeValue(body)
+    });
+    const response = await fetch(url, {
+      method,
+      headers,
       body: method !== "GET" && method !== "HEAD" ? body : undefined,
       signal: AbortSignal.timeout(upstream.timeoutMs ?? 120_000)
+    });
+    logResponseSnapshot(traceId, "codex.response", response, {
+      provider: "openai",
+      upstreamId: upstream.id,
+      upstreamMode: "codex",
+      operation: "proxy",
+      method,
+      url
     });
 
     if (!response.ok) {

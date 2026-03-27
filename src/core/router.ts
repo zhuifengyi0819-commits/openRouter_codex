@@ -12,11 +12,17 @@ import type {
   WorkspaceConfig,
   WorkspaceSummary
 } from "../types/api.js";
+import {
+  buildOpenAIChatUpstreamPayload,
+  buildOpenAIEmbeddingsUpstreamPayload,
+  buildOpenAIResponsesUpstreamPayload
+} from "../adapters/openai.adapter.js";
 import { OpenAIProvider } from "../providers/openai.provider.js";
 import { AnthropicProvider } from "../providers/anthropic.provider.js";
 import { UpstreamScheduler } from "./scheduler.js";
 import { GatewayError } from "./http-error.js";
 import { isCodexUpstream } from "./openai-upstream.js";
+import { getRequestTraceId } from "./request-logs.js";
 
 interface ModelDescriptor {
   id: string;
@@ -265,10 +271,8 @@ export class GatewayRouter {
     const workspace = this.resolveWorkspace(workspaceId);
     const resolvedModel = this.resolveModel(payload.model, workspace);
     const affinity = this.resolveOpenAIAffinity(payload, requestHeaders, workspace.id, resolvedModel);
-    const upstreamPayload: OpenAIChatCompletionRequest = {
-      ...payload,
-      model: resolvedModel
-    };
+    const traceId = getRequestTraceId(requestHeaders);
+    const upstreamPayload = buildOpenAIChatUpstreamPayload(payload, resolvedModel);
     const candidates = this.preferAffinityRoute(
       workspace,
       this.selectOpenAIUpstreams(workspace, resolvedModel, "chat"),
@@ -280,7 +284,12 @@ export class GatewayRouter {
       candidates,
       resolvedModel,
       "chat_completions",
-      (upstream) => this.openAIProvider.createChatCompletion(upstream, upstreamPayload, requestHeaders, affinity),
+      (upstream) => this.openAIProvider.createChatCompletion(
+        upstream,
+        upstreamPayload,
+        requestHeaders,
+        { ...affinity, traceId }
+      ),
     );
     this.storeSessionRouteFromDispatch(affinity, result);
     return result;
@@ -295,7 +304,8 @@ export class GatewayRouter {
     const model = typeof payload.model === "string" ? payload.model : "";
     const resolvedModel = this.resolveModel(model, workspace);
     const affinity = this.resolveOpenAIAffinity(payload, requestHeaders, workspace.id, resolvedModel);
-    const upstreamPayload = { ...payload, model: resolvedModel };
+    const traceId = getRequestTraceId(requestHeaders);
+    const upstreamPayload = buildOpenAIResponsesUpstreamPayload(payload, resolvedModel);
     const candidates = this.preferAffinityRoute(
       workspace,
       this.selectOpenAIUpstreams(workspace, resolvedModel, "responses"),
@@ -307,7 +317,12 @@ export class GatewayRouter {
       candidates,
       resolvedModel,
       "responses",
-      (upstream) => this.openAIProvider.createResponse(upstream, upstreamPayload, requestHeaders, affinity),
+      (upstream) => this.openAIProvider.createResponse(
+        upstream,
+        upstreamPayload,
+        requestHeaders,
+        { ...affinity, traceId }
+      ),
     );
     this.storeSessionRouteFromDispatch(affinity, result);
     await this.rememberResponseRouteFromResponse(result);
@@ -362,7 +377,7 @@ export class GatewayRouter {
     const workspace = this.resolveWorkspace(workspaceId);
     const model = typeof payload.model === "string" ? payload.model : "";
     const resolvedModel = this.resolveModel(model, workspace);
-    const upstreamPayload = { ...payload, model: resolvedModel };
+    const upstreamPayload = buildOpenAIEmbeddingsUpstreamPayload(payload, resolvedModel);
 
     return this.dispatchWithFailover(
       workspace.id,

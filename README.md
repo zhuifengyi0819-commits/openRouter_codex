@@ -20,6 +20,7 @@
 - `chat.completions` 支持 `tools`、`tool_choice`、`parallel_tool_calls`、`tool_calls` 历史回放
 - 浏览器管理页
 - 管理页可查看 team 级请求量、失败量、延时和 token 使用量
+- 调试日志支持按开关启用，默认关闭
 - 本地加密存储 upstream 凭据
 - `responseId -> upstream` 粘性路由持久化，重启后保留
 - Codex upstream 健康检查、启停、删除
@@ -69,11 +70,18 @@ OAUTH_CONNECT_TOKEN_PATH=/oauth/token
 OAUTH_CONNECT_API_BASE_URL=https://chatgpt.com/backend-api
 ```
 
+调试日志默认关闭，只在排查问题时建议打开：
+
+```env
+REQUEST_LOGGING_ENABLED=false
+```
+
 说明：
 
 - Web 管理页里的 `Connect Codex Team` 会先回到本地 `http://localhost:1455/auth/callback`
 - 这个本地 relay 再把浏览器转回当前网关的 `${OAUTH_CALLBACK_PATH}` 页面完成保存
 - `OAUTH_REDIRECT_ORIGIN` 本地默认留空，只影响通用 OAuth 连接器；放在反向代理或公网域名后面时再手动指定
+- 打开 `REQUEST_LOGGING_ENABLED=true` 后，会按请求生成 `logs/<x-gateway-request-id>.jsonl` 链路日志，包含进入请求、上游请求/响应和网关最终响应
 
 ### 3.2 通过 CLI 登录 Codex
 
@@ -223,6 +231,7 @@ npm test
 - 这类 upstream 不显示 `Refresh Models`
 - 管理页状态接口已经做了 token 脱敏
 - `/admin/api/runtime` 和管理页可查看 team 级 cooldown、请求成功/失败计数、延时、token 用量、缓存和粘性路由摘要
+- `/admin/api/usage` 和 `/v1/gateway/usage` 可直接查看 Codex / OpenAI / Anthropic 的请求量、token 统计、Codex token 过期时间，以及基于 429 错误推断的 quota exhausted 状态
 
 ## 6. 调用示例
 
@@ -300,6 +309,7 @@ curl http://localhost:3000/v1/chat/completions \
 - 多 team 想稳定命中上游 prompt cache，给相同会话固定传 `session_id`
 - 如果客户端后续要 `GET/DELETE /v1/responses/:id`，保留响应头里的 `x-gateway-upstream`
 - 用 `/ready` 做实例 readiness，用 `/health` 看完整运行态摘要
+- 正常运行建议保持 `REQUEST_LOGGING_ENABLED=false`，只在联调或排障时临时开启
 - 上线前至少跑一次 `npm test && npm run build`
 - 复杂多模态或需要完整原生字段时，仍优先用 `/v1/responses`，兼容层主要解决 `chat.completions` 接入成本
 
@@ -330,11 +340,33 @@ curl http://localhost:3000/v1/messages \
   }'
 ```
 
+查看网关用量摘要：
+
+```cmd
+curl http://localhost:3000/v1/gateway/usage ^
+  -H "Authorization: Bearer dev-gateway-key" ^
+  -H "x-workspace-id: team-a"
+```
+
+管理端查看指定 workspace 的用量摘要：
+
+```cmd
+curl "http://localhost:3000/admin/api/usage?setupToken=<setupToken>&workspaceId=team-a"
+```
+
+返回结果重点字段：
+
+- `totals.totalTokens`: 当前筛选范围内累计 token
+- `codex.quotaExhausted`: 被推断为 quota exhausted 的 Codex upstream 数量
+- `upstreams[].oauth2.expiresAt`: Codex OAuth access token 过期时间
+- `upstreams[].quota.blockedUntil`: 因 429 / 配额问题被 scheduler 冷却到何时
+
 ## 7. 已知边界
 
 - Codex 代理当前优先保证 `/v1/responses` 和 `chat.completions` 可用
 - `embeddings` 只会路由到普通 OpenAI-compatible upstream，不会打到 Codex upstream
 - `GET /v1/models/:id` 在纯 Codex workspace 下依赖网关本地模型清单
+- Codex 官方链路不会稳定返回“账号剩余额度”这样的精确余额字段；当前接口提供的是请求量、token 用量、OAuth token 有效期，以及根据上游错误推断出来的 quota exhausted / blocked 状态
 - 真实联机行为仍取决于上游账号配额、订阅状态和 OpenAI 后端协议变化
 
 ## 8. 常用命令

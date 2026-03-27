@@ -18,6 +18,22 @@ function parseInteger(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (!value) {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  throw new Error(`Expected boolean but received "${value}"`);
+}
+
 function parseJson<T>(value: string | undefined, fallback: T, label: string): T {
   if (!value) {
     return fallback;
@@ -221,6 +237,7 @@ export function loadConfig(): GatewayConfig {
     port: parseInteger(process.env.PORT, 3000),
     host: process.env.HOST ?? "0.0.0.0",
     logLevel: process.env.LOG_LEVEL ?? "info",
+    requestLoggingEnabled: parseBoolean(process.env.REQUEST_LOGGING_ENABLED, false),
     requestTimeoutMs,
     dataDir: path.resolve(process.cwd(), process.env.DATA_DIR ?? ".gateway-data"),
     gatewayApiKeys: parseList(process.env.GATEWAY_API_KEYS),

@@ -215,6 +215,18 @@ export async function registerAdminRoutes(app: FastifyInstance, deps: RouteDeps)
     return deps.runtime.getRuntimeSummary();
   });
 
+  app.get("/admin/api/usage", async (request) => {
+    const query = request.query as Record<string, unknown>;
+    requireSetupToken(
+      deps.setupTokens,
+      request.headers as Record<string, unknown>,
+      query
+    );
+
+    const workspaceId = typeof query.workspaceId === "string" ? query.workspaceId : undefined;
+    return deps.runtime.getUsageSummary(workspaceId);
+  });
+
   app.get("/admin/api/connectors", async (request) => {
     requireSetupToken(
       deps.setupTokens,

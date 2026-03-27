@@ -21,6 +21,15 @@ import {
 } from "./openai-upstream.js";
 import { buildAuthHeaders } from "./upstream-auth.js";
 
+function isQuotaExhaustedError(message?: string): boolean {
+  if (!message) {
+    return false;
+  }
+
+  const normalized = message.toLowerCase();
+  return normalized.includes("insufficient_quota") || normalized.includes("exceeded your current quota");
+}
+
 export class GatewayRuntime {
   private currentPersistedState: PersistedGatewayState = {
     upstreams: [],
@@ -76,6 +85,7 @@ export class GatewayRuntime {
     uptimeMs: number;
     configuredUpstreams: number;
     configuredWorkspaces: number;
+    requestLoggingEnabled: boolean;
     persistedResponseRoutes: number;
     persistedSessionRoutes: number;
     scheduler: ReturnType<GatewayRouter["getRuntimeSummary"]>["scheduler"];
@@ -89,12 +99,143 @@ export class GatewayRuntime {
       uptimeMs: Date.now() - this.startedAt,
       configuredUpstreams: this.mergedConfig.upstreams.length,
       configuredWorkspaces: this.mergedConfig.workspaces.length,
+      requestLoggingEnabled: this.mergedConfig.requestLoggingEnabled,
       persistedResponseRoutes: this.currentPersistedState.responseRoutes?.length ?? 0,
       persistedSessionRoutes: this.currentPersistedState.sessionRoutes?.length ?? 0,
       scheduler: gatewaySummary.scheduler,
       modelsCache: gatewaySummary.modelsCache,
       responseRoutes: gatewaySummary.responseRoutes,
       sessionRoutes: gatewaySummary.sessionRoutes
+    };
+  }
+
+  public getUsageSummary(workspaceId?: string): {
+    generatedAt: string;
+    workspaceId: string | null;
+    requestLoggingEnabled: boolean;
+    totals: {
+      upstreams: number;
+      codexUpstreams: number;
+      openAIPlatformUpstreams: number;
+      anthropicUpstreams: number;
+      totalRequests: number;
+      successfulRequests: number;
+      failedRequests: number;
+      networkErrors: number;
+      promptTokens: number;
+      completionTokens: number;
+      totalTokens: number;
+    };
+    codex: {
+      upstreams: number;
+      quotaExhausted: number;
+      blocked: number;
+      tokenExpiringSoon: number;
+    };
+    upstreams: Array<{
+      id: string;
+      kind: UpstreamConfig["kind"];
+      openaiMode?: UpstreamConfig["openaiMode"];
+      enabled: boolean;
+      baseUrl: string;
+      models: string[];
+      authMode: UpstreamConfig["authMode"];
+      oauth2?: {
+        accountId?: string;
+        expiresAt?: string;
+        expiresInMs?: number;
+      };
+      requests: {
+        total: number;
+        successful: number;
+        failed: number;
+        networkErrors: number;
+        byOperation: ReturnType<GatewayRouter["getRuntimeSummary"]>["scheduler"][number]["requestCounts"];
+      };
+      latency: ReturnType<GatewayRouter["getRuntimeSummary"]>["scheduler"][number]["latency"];
+      usage: ReturnType<GatewayRouter["getRuntimeSummary"]>["scheduler"][number]["usage"];
+      quota: {
+        exhausted: boolean;
+        blockedUntil?: number;
+        lastStatus?: number;
+        lastError?: string;
+      };
+    }>;
+  } {
+    const now = Date.now();
+    const scheduler = this.gateway.getSchedulerSnapshot();
+    const allowedUpstreamIds = workspaceId
+      ? new Set(this.resolveWorkspaceConfig(workspaceId).upstreamIds ?? [])
+      : undefined;
+    const upstreamStates = allowedUpstreamIds
+      ? scheduler.filter((item) => allowedUpstreamIds.has(item.id))
+      : scheduler;
+    const upstreamConfigById = new Map(this.mergedConfig.upstreams.map((upstream) => [upstream.id, upstream]));
+
+    const upstreams = upstreamStates.map((state) => {
+      const config = upstreamConfigById.get(state.id);
+      const expiresAtMs = config?.oauth2?.expiresAt ? new Date(config.oauth2.expiresAt).getTime() : undefined;
+      return {
+        id: state.id,
+        kind: state.kind,
+        openaiMode: config?.openaiMode,
+        enabled: config?.enabled !== false,
+        baseUrl: config?.baseUrl ?? "",
+        models: config?.models ?? [],
+        authMode: config?.authMode,
+        oauth2: config?.authMode === "oauth2"
+          ? {
+              accountId: config.oauth2?.accountId,
+              expiresAt: config.oauth2?.expiresAt,
+              expiresInMs: typeof expiresAtMs === "number" ? expiresAtMs - now : undefined
+            }
+          : undefined,
+        requests: {
+          total: state.totalRequests,
+          successful: state.successfulRequests,
+          failed: state.failedRequests,
+          networkErrors: state.networkErrors,
+          byOperation: state.requestCounts
+        },
+        latency: state.latency,
+        usage: state.usage,
+        quota: {
+          exhausted: isQuotaExhaustedError(state.lastError),
+          blockedUntil: state.blockedUntil,
+          lastStatus: state.lastStatus,
+          lastError: state.lastError
+        }
+      };
+    });
+
+    return {
+      generatedAt: new Date().toISOString(),
+      workspaceId: workspaceId ?? null,
+      requestLoggingEnabled: this.mergedConfig.requestLoggingEnabled,
+      totals: {
+        upstreams: upstreams.length,
+        codexUpstreams: upstreams.filter((item) => item.openaiMode === "codex").length,
+        openAIPlatformUpstreams: upstreams.filter((item) => item.kind === "openai" && item.openaiMode !== "codex").length,
+        anthropicUpstreams: upstreams.filter((item) => item.kind === "anthropic").length,
+        totalRequests: upstreams.reduce((sum, item) => sum + item.requests.total, 0),
+        successfulRequests: upstreams.reduce((sum, item) => sum + item.requests.successful, 0),
+        failedRequests: upstreams.reduce((sum, item) => sum + item.requests.failed, 0),
+        networkErrors: upstreams.reduce((sum, item) => sum + item.requests.networkErrors, 0),
+        promptTokens: upstreams.reduce((sum, item) => sum + item.usage.promptTokens, 0),
+        completionTokens: upstreams.reduce((sum, item) => sum + item.usage.completionTokens, 0),
+        totalTokens: upstreams.reduce((sum, item) => sum + item.usage.totalTokens, 0)
+      },
+      codex: {
+        upstreams: upstreams.filter((item) => item.openaiMode === "codex").length,
+        quotaExhausted: upstreams.filter((item) => item.openaiMode === "codex" && item.quota.exhausted).length,
+        blocked: upstreams.filter((item) => item.openaiMode === "codex" && item.quota.blockedUntil !== undefined).length,
+        tokenExpiringSoon: upstreams.filter((item) =>
+          item.openaiMode === "codex" &&
+          typeof item.oauth2?.expiresInMs === "number" &&
+          item.oauth2.expiresInMs <= 5 * 60_000
+        ).length
+      },
+      upstreams
     };
   }
 
@@ -533,6 +674,17 @@ export class GatewayRuntime {
       workspaces: normalized.workspaces,
       defaultWorkspaceId: normalized.defaultWorkspaceId
     };
+  }
+
+  private resolveWorkspaceConfig(workspaceId: string): WorkspaceConfig {
+    const workspace = this.mergedConfig.workspaces.find((item) => item.id === workspaceId);
+    if (!workspace) {
+      throw new GatewayError(404, `Unknown workspace "${workspaceId}"`);
+    }
+    if (workspace.enabled === false) {
+      throw new GatewayError(403, `Workspace "${workspaceId}" is disabled`);
+    }
+    return workspace;
   }
 
   private applyState(state: PersistedGatewayState): void {

@@ -109,6 +109,174 @@ test("dispatchOpenAIResponses retries another upstream on 429", async () => {
   }
 });
 
+test("dispatchOpenAI normalizes chat body before sending upstream", async () => {
+  const originalFetch = globalThis.fetch;
+  const router = createRouter();
+  let requestBody: Record<string, unknown> | undefined;
+
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ id: "chat_ok" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    await router.dispatchOpenAI({
+      model: "gpt-5.4",
+      input: "hello",
+      session_id: "sess_internal",
+      prompt_cache_key: "cache_internal",
+      functions: [
+        {
+          name: "lookup_weather",
+          description: "Lookup weather",
+          parameters: {
+            type: "object",
+            properties: {
+              city: { type: "string" }
+            }
+          }
+        }
+      ],
+      function_call: {
+        name: "lookup_weather"
+      },
+      response_format: "json_object",
+      max_output_tokens: 128
+    }, {}, "default");
+
+    assert.ok(requestBody);
+    assert.equal(requestBody?.model, "gpt-5.4");
+    assert.equal(requestBody?.session_id, undefined);
+    assert.equal(requestBody?.prompt_cache_key, undefined);
+    assert.equal(requestBody?.max_output_tokens, undefined);
+    assert.equal(requestBody?.max_completion_tokens, 128);
+    assert.deepEqual(requestBody?.response_format, { type: "json_object" });
+    assert.deepEqual(requestBody?.messages, [
+      {
+        role: "user",
+        content: "hello"
+      }
+    ]);
+    assert.deepEqual(requestBody?.tool_choice, {
+      type: "function",
+      function: {
+        name: "lookup_weather"
+      }
+    });
+    assert.deepEqual(requestBody?.tools, [
+      {
+        type: "function",
+        function: {
+          name: "lookup_weather",
+          description: "Lookup weather",
+          parameters: {
+            type: "object",
+            properties: {
+              city: { type: "string" }
+            }
+          }
+        }
+      }
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("dispatchOpenAIResponses normalizes chat-style body before sending upstream", async () => {
+  const originalFetch = globalThis.fetch;
+  const router = createRouter();
+  let requestBody: Record<string, unknown> | undefined;
+
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ id: "resp_ok" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    await router.dispatchOpenAIResponses({
+      model: "gpt-5.4",
+      session_id: "sess_internal",
+      max_tokens: 64,
+      response_format: "json_object",
+      messages: [
+        { role: "system", content: "You are helpful." },
+        { role: "user", content: "hello" }
+      ]
+    }, {}, "default");
+
+    assert.ok(requestBody);
+    assert.equal(requestBody?.session_id, undefined);
+    assert.equal(requestBody?.messages, undefined);
+    assert.equal(requestBody?.max_tokens, undefined);
+    assert.equal(requestBody?.max_output_tokens, 64);
+    assert.deepEqual(requestBody?.text, {
+      format: { type: "json_object" }
+    });
+    assert.equal(requestBody?.instructions, "You are helpful.");
+    assert.deepEqual(requestBody?.input, [
+      {
+        role: "user",
+        content: "hello"
+      }
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("dispatchOpenAIEmbeddings strips gateway-only fields before sending upstream", async () => {
+  const originalFetch = globalThis.fetch;
+  const router = createRouter();
+  let requestBody: Record<string, unknown> | undefined;
+
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ object: "list", data: [] }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    await router.dispatchOpenAIEmbeddings({
+      model: "gpt-5.4",
+      input: "hello",
+      session_id: "sess_internal",
+      prompt_cache_key: "cache_internal",
+      encodingFormat: "float",
+      metadata: {
+        session_id: "nested_session",
+        prompt_cache_key: "nested_cache",
+        user: "demo"
+      }
+    }, {}, "default");
+
+    assert.ok(requestBody);
+    assert.equal(requestBody?.session_id, undefined);
+    assert.equal(requestBody?.prompt_cache_key, undefined);
+    assert.equal(requestBody?.encodingFormat, undefined);
+    assert.equal(requestBody?.encoding_format, "float");
+    assert.deepEqual(requestBody?.metadata, {
+      user: "demo"
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("streaming responses remember the upstream before follow-up GET", async () => {
   const originalFetch = globalThis.fetch;
   const calls: string[] = [];

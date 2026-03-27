@@ -10,6 +10,14 @@ import { OAuthStateManager } from "./core/oauth-state.js";
 import { SecretStore } from "./core/secret-store.js";
 import { SetupTokenManager } from "./core/setup-token.js";
 import { startTokenRefreshLoop } from "./core/token-refresh.js";
+import {
+  REQUEST_TRACE_HEADER,
+  appendTraceEvent,
+  configureRequestLogging,
+  ensureRequestTraceId,
+  sanitizeHeaders,
+  sanitizeValue
+} from "./core/request-logs.js";
 import { registerOpenAIRoutes } from "./routes/openai.js";
 import { registerAnthropicRoutes } from "./routes/anthropic.js";
 import { registerAdminRoutes } from "./routes/admin.js";
@@ -28,8 +36,71 @@ function parseGatewayToken(headers: Record<string, unknown>): string | undefined
   return typeof apiKey === "string" ? apiKey : undefined;
 }
 
+function isOpenAIRoute(url: string): boolean {
+  return url.startsWith("/v1/") && !url.startsWith("/v1/messages");
+}
+
+function mapOpenAIErrorType(statusCode: number): string {
+  if (statusCode === 429) {
+    return "rate_limit_error";
+  }
+  if (statusCode >= 500) {
+    return "server_error";
+  }
+  return "invalid_request_error";
+}
+
+function sendOpenAIError(
+  reply: { code: (statusCode: number) => any; header: (key: string, value: string) => any; type: (value: string) => any; send: (payload: unknown) => any },
+  statusCode: number,
+  message: string,
+  details?: unknown,
+  traceId?: string
+) {
+  const detailObject =
+    details && typeof details === "object" && !Array.isArray(details)
+      ? details as Record<string, unknown>
+      : undefined;
+
+  if (statusCode === 401) {
+    reply.header("www-authenticate", 'Bearer realm="OpenAI-Compatible Gateway"');
+  }
+
+  const payload = {
+    error: {
+      message,
+      type:
+        typeof detailObject?.type === "string"
+          ? detailObject.type
+          : mapOpenAIErrorType(statusCode),
+      param:
+        typeof detailObject?.param === "string"
+          ? detailObject.param
+          : null,
+      code:
+        typeof detailObject?.code === "string"
+          ? detailObject.code
+          : null
+    }
+  };
+
+  void appendTraceEvent(traceId, {
+    stage: "gateway.response",
+    source: "gateway_error",
+    status: statusCode,
+    body: payload,
+    details: detailObject
+  });
+
+  return reply
+    .code(statusCode)
+    .type("application/json; charset=utf-8")
+    .send(payload);
+}
+
 export async function buildServer() {
   const config = loadConfig();
+  configureRequestLogging(config.requestLoggingEnabled);
   const app = Fastify({
     logger: {
       level: config.logLevel
@@ -58,7 +129,25 @@ export async function buildServer() {
     );
   }
 
+  app.addHook("onRequest", async (request, reply) => {
+    const traceId = ensureRequestTraceId(request.headers as Record<string, unknown>);
+    reply.header(REQUEST_TRACE_HEADER, traceId);
+  });
+
   app.addHook("preHandler", async (request) => {
+    const traceId = ensureRequestTraceId(request.headers as Record<string, unknown>);
+    if (!(request as any).__gatewayTraceLogged) {
+      (request as any).__gatewayTraceLogged = true;
+      void appendTraceEvent(traceId, {
+        stage: "incoming.request",
+        method: request.method,
+        url: request.url,
+        routeUrl: request.routeOptions.url ?? null,
+        headers: sanitizeHeaders(request.headers as Record<string, unknown>),
+        body: sanitizeValue(request.body)
+      });
+    }
+
     const routeUrl = request.routeOptions.url ?? "";
 
     if (
@@ -77,7 +166,14 @@ export async function buildServer() {
 
     const token = parseGatewayToken(request.headers as Record<string, unknown>);
     if (!token || !config.gatewayApiKeys.includes(token)) {
-      throw new GatewayError(401, "Invalid gateway API key");
+      void appendTraceEvent(traceId, {
+        stage: "gateway.auth_failed",
+        reason: "invalid_api_key"
+      });
+      throw new GatewayError(401, "Invalid API key provided", {
+        code: "invalid_api_key",
+        type: "invalid_request_error"
+      });
     }
   });
 
@@ -108,9 +204,42 @@ export async function buildServer() {
   await registerOpenAIRoutes(app, { runtime });
   await registerAnthropicRoutes(app, { runtime });
 
+  app.setNotFoundHandler((request, reply) => {
+    const traceId = ensureRequestTraceId(request.headers as Record<string, unknown>);
+    void appendTraceEvent(traceId, {
+      stage: "gateway.not_found",
+      method: request.method,
+      url: request.url
+    });
+    if (isOpenAIRoute(request.url)) {
+      return sendOpenAIError(reply, 404, `Invalid URL (${request.method} ${request.url})`, undefined, traceId);
+    }
+
+    return reply.code(404).send({
+      error: "NotFound",
+      message: `Route ${request.method}:${request.url} not found`
+    });
+  });
+
   app.setErrorHandler((error, request, reply) => {
+    const traceId = ensureRequestTraceId(request.headers as Record<string, unknown>);
     if ((error as NodeJS.ErrnoException).code === "ERR_STREAM_PREMATURE_CLOSE") {
       return reply.code(499).send();
+    }
+
+    if (isOpenAIRoute(request.url)) {
+      if (error instanceof GatewayError) {
+        return sendOpenAIError(reply, error.statusCode, error.message, error.details, traceId);
+      }
+
+      request.log.error(error);
+      return sendOpenAIError(
+        reply,
+        500,
+        "The server had an error while processing your request.",
+        undefined,
+        traceId
+      );
     }
 
     if (error instanceof GatewayError) {
@@ -156,6 +285,9 @@ if (isMainModule) {
     console.log(`  GET  /v1/models/:id`);
     console.log(`\nAnthropic-compatible:`);
     console.log(`  POST /v1/messages`);
+    console.log(`\nGateway diagnostics:`);
+    console.log(`  GET  /v1/gateway/usage`);
+    console.log(`Request trace logs: ${config.requestLoggingEnabled ? "enabled" : "disabled"}`);
     console.log(`\nGateway token: Authorization: Bearer <GATEWAY_API_KEYS>`);
     console.log(`====================\n`);
   } catch (error) {

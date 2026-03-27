@@ -60,6 +60,7 @@ export interface GatewayConfig {
   port: number;
   host: string;
   logLevel: string;
+  requestLoggingEnabled: boolean;
   requestTimeoutMs: number;
   dataDir: string;
   gatewayApiKeys: string[];

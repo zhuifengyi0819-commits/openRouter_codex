@@ -142,6 +142,7 @@ test("chat completion request preserves tools and multimodal inputs", async () =
       "input_audio",
       "input_file"
     ]);
+    assert.equal(input[1]?.id, undefined);
     assert.equal(input[2]?.type, "function_call");
     assert.equal(input[3]?.type, "function_call_output");
   } finally {
@@ -177,6 +178,109 @@ test("responses request falls back to session id as prompt cache key", async () 
     assert.equal(response.status, 200);
     assert.equal(requestHeaders?.get("session_id"), "sess_cache");
     assert.equal(requestBody?.prompt_cache_key, "sess_cache");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses request derives codex instructions from role-based input", async () => {
+  const provider = new OpenAICodexProvider();
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ id: "resp_roles" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    const response = await provider.createResponse(upstream, {
+      model: "gpt-5.4",
+      input: [
+        { role: "system", content: "You are helpful." },
+        { role: "user", content: "hello" }
+      ]
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(requestBody?.instructions, "You are helpful.");
+    assert.deepEqual(requestBody?.input, [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "hello"
+          }
+        ]
+      }
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses request always includes codex instructions", async () => {
+  const provider = new OpenAICodexProvider();
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ id: "resp_empty_instructions" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    const response = await provider.createResponse(upstream, {
+      model: "gpt-5.4",
+      input: "hello"
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(requestBody?.instructions, "");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("responses request strips unsupported codex token limit fields", async () => {
+  const provider = new OpenAICodexProvider();
+  const originalFetch = globalThis.fetch;
+  let requestBody: Record<string, unknown> | undefined;
+
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ id: "resp_no_limit_fields" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  };
+
+  try {
+    const response = await provider.createResponse(upstream, {
+      model: "gpt-5.4",
+      input: "hello",
+      max_output_tokens: 8192,
+      max_tokens: 1024,
+      max_completion_tokens: 512
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(requestBody?.max_output_tokens, undefined);
+    assert.equal(requestBody?.max_tokens, undefined);
+    assert.equal(requestBody?.max_completion_tokens, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

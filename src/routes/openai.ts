@@ -1,8 +1,11 @@
 import type { FastifyInstance } from "fastify";
 
-import { normalizeOpenAIRequest } from "../adapters/openai.adapter.js";
+import {
+  normalizeOpenAIEmbeddingsRequest,
+  normalizeOpenAIRequest,
+  normalizeOpenAIResponsesRequest
+} from "../adapters/openai.adapter.js";
 import { relayResponse } from "../core/stream.js";
-import { GatewayError } from "../core/http-error.js";
 import type { GatewayRuntime } from "../core/runtime.js";
 
 interface RouteDeps {
@@ -36,13 +39,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance, deps: RouteDeps
   });
 
   app.post("/v1/responses", async (request, reply) => {
-    if (!request.body || typeof request.body !== "object") {
-      throw new GatewayError(400, "Request body must be a JSON object");
-    }
-    const payload = request.body as Record<string, unknown>;
-    if (typeof payload.model !== "string" || !payload.model.trim()) {
-      throw new GatewayError(400, "`model` is required");
-    }
+    const { payload } = normalizeOpenAIResponsesRequest(request.body);
     const result = await deps.runtime.getGateway().dispatchOpenAIResponses(
       payload, request.headers, getWorkspaceId(request as any)
     );
@@ -50,13 +47,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance, deps: RouteDeps
   });
 
   app.post("/v1/embeddings", async (request, reply) => {
-    if (!request.body || typeof request.body !== "object") {
-      throw new GatewayError(400, "Request body must be a JSON object");
-    }
-    const payload = request.body as Record<string, unknown>;
-    if (typeof payload.model !== "string" || !payload.model.trim()) {
-      throw new GatewayError(400, "`model` is required");
-    }
+    const { payload } = normalizeOpenAIEmbeddingsRequest(request.body);
     const result = await deps.runtime.getGateway().dispatchOpenAIEmbeddings(
       payload, request.headers, getWorkspaceId(request as any)
     );
